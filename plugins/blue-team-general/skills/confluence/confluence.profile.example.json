@@ -1,0 +1,21 @@
+{
+  "profileName": "blue-labs-medikairos",
+  "baseUrl": "https://bluestudio.atlassian.net",
+  "auth": {
+    "email": "tu-correo@dominio.com",
+    "apiToken": "ATATT3xFfGF0_REEMPLAZA_CON_TU_API_TOKEN"
+  },
+
+  "projectKey": "MDKRS",
+  "boardId": 42,
+  "projectStyle": "team-managed",
+  "issueTypes": {
+    "epic": "Epic",
+    "task": "Task"
+  },
+
+  "confluence": {
+    "defaultSpaceKey": "Kairos",
+    "defaultParentUrl": "https://bluestudio.atlassian.net/wiki/spaces/medikairos/pages/3485958173/00+Project+Home"
+  }
+}

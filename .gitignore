@@ -1,0 +1,7 @@
+.DS_Store
+
+# Perfiles Atlassian con API token — viven en ~/.jira-profiles/, nunca aquí
+*.profile.json
+!*.profile.example.json
+.env
+.env.*

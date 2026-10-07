@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "ia-plugins",
+  "description": "Marketplace de plugins y skills de Claude Code compartidos con el equipo.",
+  "owner": {
+    "name": "yessicam.dev"
+  },
+  "plugins": [
+    {
+      "name": "blue-team-general",
+      "description": "Skills generales del equipo: redactar y crear tareas en Jira, leer y escribir páginas de Confluence Cloud.",
+      "author": {
+        "name": "yessicam.dev"
+      },
+      "category": "productivity",
+      "source": "./plugins/blue-team-general"
+    }
+  ]
+}
