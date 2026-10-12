@@ -74,9 +74,9 @@ siempre del perfil.
 
 - No descarga adjuntos ni imágenes (las imágenes se leen como
   `![alt](nombre-archivo.png)`).
-- Los bloques ```` ```mermaid ```` se suben como imagen PNG adjunta. Requiere
-  Node.js (`npx`) o `mmdc`; sin ellos quedan como bloque de código y la salida
-  lo avisa en `mermaidWarnings`.
+- Los bloques ```` ```mermaid ```` se suben como macro de la app Mermaid de
+  Confluence (`confluence-mermaid-macro`); el sitio debe tenerla instalada.
+  Sin la app, usar `--mermaid image` (PNG adjunto; requiere Node.js o `mmdc`).
 - No lee ni escribe comentarios de página.
 - `update` reemplaza el **cuerpo completo**; para un cambio parcial:
   `read --out` → editar → `update --body-file`.

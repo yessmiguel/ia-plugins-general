@@ -14,9 +14,9 @@ Subcomandos:
   create    -> crea una página desde markdown (idempotente por título)
   update    -> actualiza una página existente desde markdown
 
-Al escribir, cada bloque ```mermaid se renderiza a PNG (mermaid-cli vía `mmdc`
-o `npx`), se sube como adjunto de la página y se inserta como imagen. Si no hay
-renderizador disponible, el bloque queda como código y se avisa en la salida.
+Al escribir, cada bloque ```mermaid se sube como macro de la app Mermaid de
+Confluence (`confluence-mermaid-macro`), que lo renderiza en la página. Con
+`--mermaid image` se renderiza a PNG y se adjunta (para sitios sin la app).
 
 Todas las salidas relevantes se imprimen como JSON por stdout.
 """
@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -632,6 +633,19 @@ ADMONITIONS = {"info": "INFO", "note": "NOTA", "warning": "ATENCIÓN",
                "tip": "TIP", "panel": "PANEL", "expand": "DETALLE"}
 
 
+MERMAID_MACRO = "confluence-mermaid-macro"
+
+
+def _mermaid_macro_code(raw):
+    """Extrae el código del cuerpo de la macro: JSON `[{"body": ..., "date": ...}]`
+    con el historial de versiones del diagrama; la vigente es la última."""
+    try:
+        versions = json.loads(raw)
+        return versions[-1]["body"]
+    except (ValueError, LookupError, TypeError):
+        return raw
+
+
 def _render_macro_block(node, indent):
     name = _attr(node, "ac:name")
 
@@ -640,6 +654,12 @@ def _render_macro_block(node, indent):
         body = _macro_child(node, "ac:plain-text-body")
         code = _plain_text(body.children).strip("\n") if body is not None else ""
         return [_indent_block("```%s\n%s\n```" % (lang, code), indent)]
+
+    if name == MERMAID_MACRO:
+        body = _macro_child(node, "ac:plain-text-body")
+        code = _mermaid_macro_code(
+            _plain_text(body.children) if body is not None else "")
+        return [_indent_block("```mermaid\n%s\n```" % code.strip("\n"), indent)]
 
     if name in ADMONITIONS:
         label = ADMONITIONS[name]
@@ -776,7 +796,7 @@ def markdown_to_storage(text, diagrams=None):
 
     Si se pasa la lista `diagrams`, cada bloque ```mermaid se añade a ella y en
     su lugar queda un marcador que `_resolve_diagrams` sustituye después por
-    la imagen adjunta (o por el bloque de código si no se pudo renderizar).
+    la macro de Mermaid, la imagen adjunta o el bloque de código.
 
     Soporta: encabezados, párrafos, reglas (---), listas anidadas (viñeta y
     numeradas), listas de tareas (- [ ] / - [x]), citas (>), tablas,
@@ -1140,11 +1160,25 @@ def cmd_search(profile, args):
 # --------------------------------------------------------------------------- #
 
 # --------------------------------------------------------------------------- #
-# diagramas mermaid -> PNG adjunto                                             #
+# diagramas mermaid -> macro de la app, PNG adjunto o código                   #
 # --------------------------------------------------------------------------- #
 
 _DIAGRAM_MARK = "@@MERMAID-DIAGRAM-%d@@"
 MERMAID_CLI_PACKAGE = "@mermaid-js/mermaid-cli"
+MERMAID_MODES = ("macro", "image", "code")
+
+
+def _mermaid_macro(code):
+    """Macro de la app Mermaid de Confluence, con el formato que ella guarda."""
+    body = json.dumps([{"body": code, "date": int(time.time() * 1000)}],
+                      ensure_ascii=False)
+    return ('<ac:structured-macro ac:name="%s" ac:schema-version="1">'
+            '<ac:parameter ac:name="theme">default</ac:parameter>'
+            '<ac:parameter ac:name="alignment">left</ac:parameter>'
+            '<ac:parameter ac:name="look">classic</ac:parameter>'
+            '<ac:plain-text-body><![CDATA[%s]]></ac:plain-text-body>'
+            '</ac:structured-macro>'
+            % (MERMAID_MACRO, body.replace("]]>", "]]]]><![CDATA[>")))
 
 
 def _mermaid_command():
@@ -1217,21 +1251,24 @@ def upload_attachment(profile, page_id, path, filename):
         return "No se pudo subir %s: %s" % (filename, exc.reason)
 
 
-def _resolve_diagrams(profile, page_id, storage, diagrams, as_images=True):
+def _resolve_diagrams(profile, page_id, storage, diagrams, mode="macro"):
     """Sustituye los marcadores de diagrama. Devuelve (storage, informe).
 
-    Con `page_id` y `as_images`, renderiza cada diagrama, lo adjunta a la página
-    y deja la imagen. En cualquier otro caso (o si algo falla) deja el bloque de
-    código, para no perder nunca el diagrama.
+    - `macro`: macro de la app Mermaid de Confluence (la renderiza la página).
+    - `image`: PNG adjunto a la página; necesita `page_id`. Si falla el
+      renderizado o la subida, ese diagrama queda como código.
+    - `code`: bloque de código.
     """
-    report = {"total": len(diagrams), "images": 0, "asCode": 0, "warnings": []}
+    report = {"total": len(diagrams), "mode": mode, "images": 0, "warnings": []}
     if not diagrams:
         return storage, report
     workdir = tempfile.mkdtemp(prefix="confluence-mermaid-")
     try:
         for index, code in enumerate(diagrams):
             html = None
-            if page_id and as_images:
+            if mode == "macro":
+                html = _mermaid_macro(code)
+            elif mode == "image" and page_id:
                 filename = _diagram_filename(code)
                 error = None
                 if not attachment_exists(profile, page_id, filename):
@@ -1247,7 +1284,6 @@ def _resolve_diagrams(profile, page_id, storage, diagrams, as_images=True):
                     report["images"] += 1
             if html is None:
                 html = _code_macro(code, "mermaid")
-                report["asCode"] += 1
             storage = storage.replace(_DIAGRAM_MARK % index, html)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -1257,7 +1293,9 @@ def _resolve_diagrams(profile, page_id, storage, diagrams, as_images=True):
 def _diagram_fields(report):
     if not report["total"]:
         return {}
-    out = {"mermaidDiagrams": report["total"], "mermaidAsImages": report["images"]}
+    out = {"mermaidDiagrams": report["total"], "mermaidMode": report["mode"]}
+    if report["mode"] == "image":
+        out["mermaidAsImages"] = report["images"]
     if report["warnings"]:
         out["mermaidWarnings"] = report["warnings"]
     return out
@@ -1299,7 +1337,7 @@ def cmd_create(profile, args):
     markdown = read_body(args)
     diagrams = []
     storage = markdown_to_storage(markdown, diagrams)
-    as_images = not args.mermaid_as_code
+    mode = args.mermaid
 
     parent_id = None
     if args.parent:
@@ -1319,12 +1357,12 @@ def cmd_create(profile, args):
     if existing and args.update_if_exists:
         _do_update(profile, existing.get("id"), args.title, storage,
                    args.dry_run, args.version_message,
-                   diagrams=diagrams, as_images=as_images)
+                   diagrams=diagrams, mode=mode)
         return
 
-    # Los adjuntos necesitan una página que ya exista: se crea primero con los
-    # diagramas como código y, si se pudieron renderizar, se actualiza después.
-    initial, _ = _resolve_diagrams(profile, None, storage, diagrams)
+    # En modo `image` los adjuntos necesitan una página que ya exista: se crea
+    # primero con los diagramas como código y se actualiza después.
+    initial, report = _resolve_diagrams(profile, None, storage, diagrams, mode)
     payload = {"spaceId": space["id"], "status": "current",
                "title": args.title,
                "body": {"representation": "storage", "value": initial}}
@@ -1344,9 +1382,9 @@ def cmd_create(profile, args):
     if status not in (200, 201) or not isinstance(data, dict):
         die("No se pudo crear la página (HTTP %s)." % status, data)
 
-    report = {"total": 0, "images": 0, "asCode": 0, "warnings": []}
-    if diagrams and as_images:
-        final, report = _resolve_diagrams(profile, data.get("id"), storage, diagrams)
+    if diagrams and mode == "image":
+        final, report = _resolve_diagrams(profile, data.get("id"), storage,
+                                          diagrams, mode)
         if report["images"]:
             version = (data.get("version") or {}).get("number") or 1
             update = {"id": str(data.get("id")), "status": "current",
@@ -1363,8 +1401,6 @@ def cmd_create(profile, args):
                     "La página se creó, pero no se pudieron insertar las "
                     "imágenes (HTTP %s); los diagramas quedaron como código." % status)
                 report["images"] = 0
-    elif diagrams:
-        report["total"] = report["asCode"] = len(diagrams)
 
     out = {"ok": True, "action": "created", "pageId": data.get("id"),
            "title": data.get("title"), "space": key,
@@ -1375,7 +1411,7 @@ def cmd_create(profile, args):
 
 
 def _do_update(profile, page_id, new_title, storage, dry_run, message,
-               expected_version=None, diagrams=None, as_images=True):
+               expected_version=None, diagrams=None, mode="macro"):
     current = get_page(profile, page_id, body_format=None)
     version = (current.get("version") or {}).get("number") or 1
     title = new_title or current.get("title")
@@ -1388,7 +1424,7 @@ def _do_update(profile, page_id, new_title, storage, dry_run, message,
     diagrams = diagrams or []
     if dry_run:
         # El simulacro no renderiza ni sube adjuntos.
-        storage, _ = _resolve_diagrams(profile, None, storage, diagrams)
+        storage, _ = _resolve_diagrams(profile, None, storage, diagrams, mode)
         out = {"ok": True, "dryRun": True, "action": "update",
                "pageId": page_id, "title": title,
                "currentVersion": version, "nextVersion": version + 1,
@@ -1399,7 +1435,7 @@ def _do_update(profile, page_id, new_title, storage, dry_run, message,
         return
 
     storage, report = _resolve_diagrams(profile, page_id, storage, diagrams,
-                                        as_images)
+                                        mode)
 
     payload = {"id": str(page_id), "status": "current", "title": title,
                "body": {"representation": "storage", "value": storage},
@@ -1424,7 +1460,7 @@ def cmd_update(profile, args):
     storage = markdown_to_storage(markdown, diagrams)
     _do_update(profile, target["pageId"], args.title, storage, args.dry_run,
                args.version_message, args.expected_version,
-               diagrams=diagrams, as_images=not args.mermaid_as_code)
+               diagrams=diagrams, mode=args.mermaid)
 
 
 # --------------------------------------------------------------------------- #
@@ -1471,8 +1507,9 @@ def main():
     p.add_argument("--update-if-exists", action="store_true",
                    help="Si ya existe una página con ese título, la actualiza")
     p.add_argument("--version-message", help="Mensaje de versión")
-    p.add_argument("--mermaid-as-code", action="store_true",
-                   help="Deja los bloques mermaid como código, sin imagen")
+    p.add_argument("--mermaid", choices=MERMAID_MODES, default="macro",
+                   help="Cómo subir los bloques mermaid: macro de la app de "
+                        "Confluence (default), image (PNG adjunto) o code")
     p.add_argument("--dry-run", action="store_true")
 
     p = sub.add_parser("update", help="Actualiza una página existente")
@@ -1483,8 +1520,9 @@ def main():
     p.add_argument("--expected-version", type=int,
                    help="Falla si la página ya no va en esta versión")
     p.add_argument("--version-message", help="Mensaje de versión")
-    p.add_argument("--mermaid-as-code", action="store_true",
-                   help="Deja los bloques mermaid como código, sin imagen")
+    p.add_argument("--mermaid", choices=MERMAID_MODES, default="macro",
+                   help="Cómo subir los bloques mermaid: macro de la app de "
+                        "Confluence (default), image (PNG adjunto) o code")
     p.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
