@@ -14,18 +14,27 @@ Subcomandos:
   create    -> crea una página desde markdown (idempotente por título)
   update    -> actualiza una página existente desde markdown
 
+Al escribir, cada bloque ```mermaid se renderiza a PNG (mermaid-cli vía `mmdc`
+o `npx`), se sube como adjunto de la página y se inserta como imagen. Si no hay
+renderizador disponible, el bloque queda como código y se avisa en la salida.
+
 Todas las salidas relevantes se imprimen como JSON por stdout.
 """
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from html.parser import HTMLParser
 
 
@@ -678,6 +687,7 @@ _INLINE_RE = re.compile(
     r"|(?<!\w)_(?P<emu>[^_]+?)_(?!\w)"
     r"|(?<![\w*])\*(?P<ems>[^*\n]+?)\*(?![\w*])"
     r"|~~(?P<del>.+?)~~"
+    r"|!\[(?P<ialt>[^\]]*)\]\((?P<isrc>[^)]+)\)"
     r"|\[(?P<ltext>[^\]]+)\]\((?P<lhref>[^)]+)\)")
 
 
@@ -691,8 +701,22 @@ def esc_attr(text):
 
 def md_inline(text):
     """Convierte inline markdown a XHTML. Escapa primero, marca después."""
+    return _md_inline_escaped(esc(text))
+
+
+def _image_storage(src, alt=""):
+    """Imagen: URL externa o adjunto de la página (por nombre de archivo)."""
+    alt_attr = ' ac:alt="%s"' % alt.replace('"', "&quot;") if alt else ""
+    src = src.replace('"', "&quot;")
+    if re.match(r"^https?://", src):
+        ref = '<ri:url ri:value="%s" />' % src
+    else:
+        ref = '<ri:attachment ri:filename="%s" />' % src
+    return "<ac:image%s>%s</ac:image>" % (alt_attr, ref)
+
+
+def _md_inline_escaped(src):
     out = []
-    src = esc(text)
     pos = 0
     for m in _INLINE_RE.finditer(src):
         if m.start() > pos:
@@ -700,13 +724,15 @@ def md_inline(text):
         if m.group("code") is not None:
             out.append("<code>%s</code>" % m.group("code"))
         elif m.group("bold") is not None:
-            out.append("<strong>%s</strong>" % m.group("bold"))
+            out.append("<strong>%s</strong>" % _md_inline_escaped(m.group("bold")))
         elif m.group("emu") is not None:
-            out.append("<em>%s</em>" % m.group("emu"))
+            out.append("<em>%s</em>" % _md_inline_escaped(m.group("emu")))
         elif m.group("ems") is not None:
-            out.append("<em>%s</em>" % m.group("ems"))
+            out.append("<em>%s</em>" % _md_inline_escaped(m.group("ems")))
         elif m.group("del") is not None:
-            out.append("<del>%s</del>" % m.group("del"))
+            out.append("<del>%s</del>" % _md_inline_escaped(m.group("del")))
+        elif m.group("isrc") is not None:
+            out.append(_image_storage(m.group("isrc"), m.group("ialt")))
         else:
             href = m.group("lhref").replace('"', "&quot;")
             out.append('<a href="%s">%s</a>' % (href, m.group("ltext")))
@@ -745,8 +771,12 @@ def _split_row(line):
     return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", s)]
 
 
-def markdown_to_storage(text):
+def markdown_to_storage(text, diagrams=None):
     """Convierte el subconjunto de markdown que usamos a storage format.
+
+    Si se pasa la lista `diagrams`, cada bloque ```mermaid se añade a ella y en
+    su lugar queda un marcador que `_resolve_diagrams` sustituye después por
+    la imagen adjunta (o por el bloque de código si no se pudo renderizar).
 
     Soporta: encabezados, párrafos, reglas (---), listas anidadas (viñeta y
     numeradas), listas de tareas (- [ ] / - [x]), citas (>), tablas,
@@ -784,7 +814,11 @@ def markdown_to_storage(text):
                 body.append(lines[i])
                 i += 1
             i += 1  # cierre
-            out.append(_code_macro("\n".join(body), lang))
+            if lang.lower() == "mermaid" and diagrams is not None:
+                diagrams.append("\n".join(body))
+                out.append(_DIAGRAM_MARK % (len(diagrams) - 1))
+            else:
+                out.append(_code_macro("\n".join(body), lang))
             continue
 
         if _RE_HR.match(s):
@@ -816,7 +850,7 @@ def markdown_to_storage(text):
                 m2 = _RE_QUOTE.match(lines[i])
                 body.append(m2.group(1) if m2 else lines[i].strip())
                 i += 1
-            inner = markdown_to_storage("\n".join(body))
+            inner = markdown_to_storage("\n".join(body), diagrams)
             out.append("<blockquote>%s</blockquote>" % inner)
             continue
 
@@ -1105,6 +1139,130 @@ def cmd_search(profile, args):
 # create / update                                                              #
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# diagramas mermaid -> PNG adjunto                                             #
+# --------------------------------------------------------------------------- #
+
+_DIAGRAM_MARK = "@@MERMAID-DIAGRAM-%d@@"
+MERMAID_CLI_PACKAGE = "@mermaid-js/mermaid-cli"
+
+
+def _mermaid_command():
+    if shutil.which("mmdc"):
+        return ["mmdc"]
+    if shutil.which("npx"):
+        return ["npx", "-y", MERMAID_CLI_PACKAGE]
+    return None
+
+
+def _diagram_filename(code):
+    digest = hashlib.sha1(code.strip().encode("utf-8")).hexdigest()[:12]
+    return "mermaid-%s.png" % digest
+
+
+def render_mermaid(code, out_path):
+    """Renderiza `code` a PNG en `out_path`. Devuelve None o el motivo del fallo."""
+    cmd = _mermaid_command()
+    if not cmd:
+        return ("No hay renderizador de Mermaid: instala Node.js (npx) o "
+                "`npm install -g %s`." % MERMAID_CLI_PACKAGE)
+    src = out_path[:-4] + ".mmd"
+    with open(src, "w", encoding="utf-8") as fh:
+        fh.write(code + "\n")
+    try:
+        proc = subprocess.run(
+            cmd + ["-i", src, "-o", out_path, "-b", "white", "-s", "2"],
+            capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "No se pudo ejecutar mermaid-cli: %s" % exc
+    if proc.returncode != 0 or not os.path.exists(out_path):
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+        return "mermaid-cli falló: %s" % " | ".join(tail)
+    return None
+
+
+def attachment_exists(profile, page_id, filename):
+    status, data = request(
+        profile, "GET", "/wiki/rest/api/content/%s/child/attachment" % page_id,
+        query={"filename": filename, "limit": 1})
+    return status == 200 and isinstance(data, dict) and bool(data.get("results"))
+
+
+def upload_attachment(profile, page_id, path, filename):
+    """Sube un archivo como adjunto de la página. Devuelve None o el error."""
+    boundary = "----confluence-skill-%s" % uuid.uuid4().hex
+    with open(path, "rb") as fh:
+        content = fh.read()
+    body = b"".join([
+        ("--%s\r\n" % boundary).encode("ascii"),
+        ('Content-Disposition: form-data; name="file"; filename="%s"\r\n'
+         % filename).encode("utf-8"),
+        b"Content-Type: image/png\r\n\r\n", content, b"\r\n",
+        ("--%s\r\n" % boundary).encode("ascii"),
+        b'Content-Disposition: form-data; name="minorEdit"\r\n\r\ntrue\r\n',
+        ("--%s--\r\n" % boundary).encode("ascii")])
+    url = "%s/wiki/rest/api/content/%s/child/attachment" % (profile["baseUrl"], page_id)
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Authorization", auth_header(profile))
+    req.add_header("Accept", "application/json")
+    req.add_header("X-Atlassian-Token", "nocheck")
+    req.add_header("Content-Type", "multipart/form-data; boundary=%s" % boundary)
+    try:
+        with urllib.request.urlopen(req, timeout=60):
+            return None
+    except urllib.error.HTTPError as exc:
+        return "HTTP %s al subir %s: %s" % (
+            exc.code, filename, exc.read().decode("utf-8", "replace")[:300])
+    except urllib.error.URLError as exc:
+        return "No se pudo subir %s: %s" % (filename, exc.reason)
+
+
+def _resolve_diagrams(profile, page_id, storage, diagrams, as_images=True):
+    """Sustituye los marcadores de diagrama. Devuelve (storage, informe).
+
+    Con `page_id` y `as_images`, renderiza cada diagrama, lo adjunta a la página
+    y deja la imagen. En cualquier otro caso (o si algo falla) deja el bloque de
+    código, para no perder nunca el diagrama.
+    """
+    report = {"total": len(diagrams), "images": 0, "asCode": 0, "warnings": []}
+    if not diagrams:
+        return storage, report
+    workdir = tempfile.mkdtemp(prefix="confluence-mermaid-")
+    try:
+        for index, code in enumerate(diagrams):
+            html = None
+            if page_id and as_images:
+                filename = _diagram_filename(code)
+                error = None
+                if not attachment_exists(profile, page_id, filename):
+                    path = os.path.join(workdir, filename)
+                    error = (render_mermaid(code, path) or
+                             upload_attachment(profile, page_id, path, filename))
+                if error:
+                    report["warnings"].append("Diagrama %d: %s" % (index + 1, error))
+                else:
+                    html = ('<ac:image ac:align="center" ac:alt="Diagrama %d">'
+                            '<ri:attachment ri:filename="%s" /></ac:image>'
+                            % (index + 1, filename))
+                    report["images"] += 1
+            if html is None:
+                html = _code_macro(code, "mermaid")
+                report["asCode"] += 1
+            storage = storage.replace(_DIAGRAM_MARK % index, html)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+    return storage, report
+
+
+def _diagram_fields(report):
+    if not report["total"]:
+        return {}
+    out = {"mermaidDiagrams": report["total"], "mermaidAsImages": report["images"]}
+    if report["warnings"]:
+        out["mermaidWarnings"] = report["warnings"]
+    return out
+
+
 def read_body(args):
     if args.body_file:
         path = os.path.expanduser(args.body_file)
@@ -1139,7 +1297,9 @@ def cmd_create(profile, args):
         die("El espacio '%s' no existe o tu cuenta no tiene acceso." % key)
 
     markdown = read_body(args)
-    storage = markdown_to_storage(markdown)
+    diagrams = []
+    storage = markdown_to_storage(markdown, diagrams)
+    as_images = not args.mermaid_as_code
 
     parent_id = None
     if args.parent:
@@ -1158,32 +1318,64 @@ def cmd_create(profile, args):
         return
     if existing and args.update_if_exists:
         _do_update(profile, existing.get("id"), args.title, storage,
-                   args.dry_run, args.version_message)
+                   args.dry_run, args.version_message,
+                   diagrams=diagrams, as_images=as_images)
         return
 
+    # Los adjuntos necesitan una página que ya exista: se crea primero con los
+    # diagramas como código y, si se pudieron renderizar, se actualiza después.
+    initial, _ = _resolve_diagrams(profile, None, storage, diagrams)
     payload = {"spaceId": space["id"], "status": "current",
                "title": args.title,
-               "body": {"representation": "storage", "value": storage}}
+               "body": {"representation": "storage", "value": initial}}
     if parent_id:
         payload["parentId"] = parent_id
 
     if args.dry_run:
-        emit({"ok": True, "dryRun": True, "action": "create",
-              "space": key, "title": args.title, "parentId": parent_id,
-              "storageChars": len(storage), "storagePreview": storage[:1200]})
+        out = {"ok": True, "dryRun": True, "action": "create",
+               "space": key, "title": args.title, "parentId": parent_id,
+               "storageChars": len(initial), "storagePreview": initial[:1200]}
+        if diagrams:
+            out["mermaidDiagrams"] = len(diagrams)
+        emit(out)
         return
 
     status, data = request(profile, "POST", "/wiki/api/v2/pages", body=payload)
     if status not in (200, 201) or not isinstance(data, dict):
         die("No se pudo crear la página (HTTP %s)." % status, data)
-    emit({"ok": True, "action": "created", "pageId": data.get("id"),
-          "title": data.get("title"), "space": key,
-          "version": (data.get("version") or {}).get("number"),
-          "url": page_url(profile, data)})
+
+    report = {"total": 0, "images": 0, "asCode": 0, "warnings": []}
+    if diagrams and as_images:
+        final, report = _resolve_diagrams(profile, data.get("id"), storage, diagrams)
+        if report["images"]:
+            version = (data.get("version") or {}).get("number") or 1
+            update = {"id": str(data.get("id")), "status": "current",
+                      "title": args.title,
+                      "body": {"representation": "storage", "value": final},
+                      "version": {"number": version + 1,
+                                  "message": "Diagramas Mermaid como imagen"}}
+            status, updated = request(
+                profile, "PUT", "/wiki/api/v2/pages/%s" % data.get("id"), body=update)
+            if status in (200, 201) and isinstance(updated, dict):
+                data = updated
+            else:
+                report["warnings"].append(
+                    "La página se creó, pero no se pudieron insertar las "
+                    "imágenes (HTTP %s); los diagramas quedaron como código." % status)
+                report["images"] = 0
+    elif diagrams:
+        report["total"] = report["asCode"] = len(diagrams)
+
+    out = {"ok": True, "action": "created", "pageId": data.get("id"),
+           "title": data.get("title"), "space": key,
+           "version": (data.get("version") or {}).get("number"),
+           "url": page_url(profile, data)}
+    out.update(_diagram_fields(report))
+    emit(out)
 
 
 def _do_update(profile, page_id, new_title, storage, dry_run, message,
-               expected_version=None):
+               expected_version=None, diagrams=None, as_images=True):
     current = get_page(profile, page_id, body_format=None)
     version = (current.get("version") or {}).get("number") or 1
     title = new_title or current.get("title")
@@ -1193,12 +1385,21 @@ def _do_update(profile, page_id, new_title, storage, dry_run, message,
             "(alguien la editó). Vuelve a leerla antes de escribir."
             % (expected_version, version))
 
+    diagrams = diagrams or []
     if dry_run:
-        emit({"ok": True, "dryRun": True, "action": "update",
-              "pageId": page_id, "title": title,
-              "currentVersion": version, "nextVersion": version + 1,
-              "storageChars": len(storage), "storagePreview": storage[:1200]})
+        # El simulacro no renderiza ni sube adjuntos.
+        storage, _ = _resolve_diagrams(profile, None, storage, diagrams)
+        out = {"ok": True, "dryRun": True, "action": "update",
+               "pageId": page_id, "title": title,
+               "currentVersion": version, "nextVersion": version + 1,
+               "storageChars": len(storage), "storagePreview": storage[:1200]}
+        if diagrams:
+            out["mermaidDiagrams"] = len(diagrams)
+        emit(out)
         return
+
+    storage, report = _resolve_diagrams(profile, page_id, storage, diagrams,
+                                        as_images)
 
     payload = {"id": str(page_id), "status": "current", "title": title,
                "body": {"representation": "storage", "value": storage},
@@ -1208,18 +1409,22 @@ def _do_update(profile, page_id, new_title, storage, dry_run, message,
                            body=payload)
     if status not in (200, 201) or not isinstance(data, dict):
         die("No se pudo actualizar la página %s (HTTP %s)." % (page_id, status), data)
-    emit({"ok": True, "action": "updated", "pageId": data.get("id"),
-          "title": data.get("title"),
-          "version": (data.get("version") or {}).get("number"),
-          "previousVersion": version, "url": page_url(profile, data)})
+    out = {"ok": True, "action": "updated", "pageId": data.get("id"),
+           "title": data.get("title"),
+           "version": (data.get("version") or {}).get("number"),
+           "previousVersion": version, "url": page_url(profile, data)}
+    out.update(_diagram_fields(report))
+    emit(out)
 
 
 def cmd_update(profile, args):
     target = resolve_target(profile, args.url)
     markdown = read_body(args)
-    storage = markdown_to_storage(markdown)
+    diagrams = []
+    storage = markdown_to_storage(markdown, diagrams)
     _do_update(profile, target["pageId"], args.title, storage, args.dry_run,
-               args.version_message, args.expected_version)
+               args.version_message, args.expected_version,
+               diagrams=diagrams, as_images=not args.mermaid_as_code)
 
 
 # --------------------------------------------------------------------------- #
@@ -1266,6 +1471,8 @@ def main():
     p.add_argument("--update-if-exists", action="store_true",
                    help="Si ya existe una página con ese título, la actualiza")
     p.add_argument("--version-message", help="Mensaje de versión")
+    p.add_argument("--mermaid-as-code", action="store_true",
+                   help="Deja los bloques mermaid como código, sin imagen")
     p.add_argument("--dry-run", action="store_true")
 
     p = sub.add_parser("update", help="Actualiza una página existente")
@@ -1276,6 +1483,8 @@ def main():
     p.add_argument("--expected-version", type=int,
                    help="Falla si la página ya no va en esta versión")
     p.add_argument("--version-message", help="Mensaje de versión")
+    p.add_argument("--mermaid-as-code", action="store_true",
+                   help="Deja los bloques mermaid como código, sin imagen")
     p.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()

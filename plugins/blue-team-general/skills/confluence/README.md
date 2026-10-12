@@ -74,6 +74,9 @@ siempre del perfil.
 
 - No descarga adjuntos ni imágenes (las imágenes se leen como
   `![alt](nombre-archivo.png)`).
+- Los bloques ```` ```mermaid ```` se suben como imagen PNG adjunta. Requiere
+  Node.js (`npx`) o `mmdc`; sin ellos quedan como bloque de código y la salida
+  lo avisa en `mermaidWarnings`.
 - No lee ni escribe comentarios de página.
 - `update` reemplaza el **cuerpo completo**; para un cambio parcial:
   `read --out` → editar → `update --body-file`.

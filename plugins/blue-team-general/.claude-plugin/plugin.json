@@ -1,6 +1,6 @@
 {
   "name": "blue-team-general",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Skills generales del equipo: redactar y crear tareas en Jira, leer y escribir páginas de Confluence Cloud.",
   "author": {
     "name": "yessicam.dev"

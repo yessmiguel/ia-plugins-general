@@ -23,6 +23,9 @@ La skill traduce en ambos sentidos:
   paneles info/nota/aviso, listas de tareas, links).
 - **markdown → storage format** al escribir (Confluence guarda XHTML, no
   markdown; el script hace la conversión para que **renderice de verdad**).
+- **Diagramas Mermaid → imagen** al escribir: cada bloque ```` ```mermaid ````
+  se renderiza a PNG, se adjunta a la página y se inserta como imagen (ver
+  **Diagramas Mermaid**).
 
 ---
 
@@ -201,7 +204,7 @@ python3 "$S" --profile $P create --space Kairos --title "Mi página" \
 python3 "$S" --profile $P create --space Kairos --title "Mi página" \
   --body-file doc.md --parent "<link-del-padre>"
 
-# Actualizar una página existente
+# Actualizar una página existente (los bloques ```mermaid suben como imagen)
 python3 "$S" --profile $P update --url "<link>" --body-file doc.md --dry-run
 python3 "$S" --profile $P update --url "<link>" --body-file doc.md \
   --expected-version 7 --version-message "Actualiza contratos de API"
@@ -247,7 +250,37 @@ pierde texto):
 | `> cita` | Blockquote |
 | `\| a \| b \|` + separador | Tabla nativa |
 | ```` ```lang ```` | Macro **code** con resaltado de sintaxis |
+| ```` ```mermaid ```` | **Imagen PNG** del diagrama, adjunta a la página |
+| `![alt](archivo.png)` | Imagen de un **adjunto que ya existe** en la página |
+| `![alt](https://…)` | Imagen externa por URL |
 | `---` | Línea horizontal |
+
+### Diagramas Mermaid
+
+Confluence no renderiza Mermaid: un bloque subido como código se ve como
+texto. Por eso `create` y `update` convierten **siempre** cada bloque
+```` ```mermaid ```` en imagen, sin que haya que pedirlo:
+
+1. Renderizan el diagrama a PNG con `mermaid-cli` (`mmdc` si está instalado;
+   si no, `npx -y @mermaid-js/mermaid-cli`, que solo requiere Node.js).
+2. Suben el PNG como adjunto de la página (`mermaid-<hash>.png`; el mismo
+   diagrama no se vuelve a subir).
+3. Insertan la imagen en el lugar del bloque.
+
+La salida JSON informa `mermaidDiagrams` (bloques encontrados) y
+`mermaidAsImages` (los que quedaron como imagen). **Revisa siempre esos dos
+números**: si no coinciden, `mermaidWarnings` dice por qué (sin Node.js,
+sintaxis inválida, fallo al adjuntar) y ese diagrama quedó como bloque de
+código; avísale al humano en vez de dar la subida por buena.
+
+- La primera vez `npx` descarga `mermaid-cli` y un Chromium; puede tardar
+  un par de minutos.
+- `--dry-run` no renderiza ni sube adjuntos: solo cuenta los diagramas.
+- `--mermaid-as-code` deja los bloques como código (solo si el humano lo pide).
+- Al **leer** una página ya subida, el diagrama vuelve como
+  `![Diagrama N](mermaid-<hash>.png)`, no como código Mermaid. Si se vuelve a
+  subir ese markdown, la imagen se conserva; para **cambiar** el diagrama hay
+  que partir del `.md` original con el bloque ```` ```mermaid ````.
 
 **Reglas de formato — críticas:**
 
